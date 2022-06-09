@@ -1,0 +1,167 @@
+---
+- name: Deploy Mezzanine CSM in prod mode
+  hosts: vagrant1
+  vars:
+    user: "{{  ansible_user  }}"
+    proj_app: mezzanine
+    proj_name: "{{ proj_app  }}"
+    venv_home: "{{  ansible_env.HOME  }}/.virtualenvs"
+    venv_path: "{{  venv_home }}/{{ proj_name  }}"
+    proj_path: "{{  ansible_env.HOME  }}/mezzanine/{{  proj_name  }}"
+    settings_path: "{{  proj_path  }}/{{  proj_name  }}"
+    reqs_path: requirements.txt
+    manage: "{{  python  }} {{  proj_path  }}/manage.py"
+    live_hostname: 192.168.1.1
+    domains:
+      - 192.168.1.1
+      - 192.168.1.2
+    repo_url: git@github.com:ansiblebook/mezzanine_example.git
+    locale: en_US.UTF-8
+    conf_path: /etc/nginx/conf
+    tls_enable: true
+    python: "{{  venv_path  }}/bin/python"
+    database_name: "{{  proj_name  }}"
+    database_user: "{{  proj_name  }}"
+    database_host: localhost
+    database_port: 5432
+    gunicorn_procname: gunicorn_mezzanine
+    num_workers: "multipocessing.cpu_count()*2+1"
+  vars_files:
+    - secrets.yml
+
+  tasks:
+    - name: Install apt packages
+      apt: pkg={{  item  }} update_cache=true cache_valid_time=3600
+      become: true
+      with_items:
+        - git
+        - libjpeg-dev
+        - libpq-dev
+        - memcached
+        - nginx
+        - postgresql
+        - python-dev
+        - python3-pip
+        - python3-psycopg2
+        - python-setuptools
+        - python3-virtualenv
+        - supervisor
+
+    - name: Create project folder
+      file: path={{  proj_path  }} state=directory
+
+    - name: Create logs path
+      file:
+        path: "{{  ansible_env.HOME }}/logs"
+        state: directory
+
+    - name: Checkout repo in the host
+      git: repo={{  repo_url  }} dest={{  proj_path  }} accept_hostkey=yes
+
+    - name: Install Python requirements via pip
+      pip: name={{  item  }} state=latest
+      with_items:
+        - pip
+        - virtualenv
+        - virtualenvwrapper
+      become: true
+
+    - name: Create loacle
+      locale_gen: name={{  locale  }}
+      become: true
+
+    - name: Create DB user
+      become: true
+      become_user: postgres
+      postgresql_user:
+        name: "{{  database_user  }}"
+        password: "{{  db_pass }}"
+
+    - name: Create database
+      postgresql_db:
+        name: "{{  database_user  }}"
+        owner: "{{ database_user  }}"
+        encoding: UTF8
+        lc_ctype: "{{  locale  }}"        
+        lc_collate: "{{  locale  }}"
+        template: template0
+      become: true
+      become_user: postgres
+
+    - name: Check conf_path exist
+      file: path={{  conf_path  }} state=directory
+      become: true
+
+    - name: Create TLS cert
+      command: >
+        openssl req -new -x509 -nodes -out {{proj_name}}.crt -keyout {{proj_name}}.key -subj '/CH=domains[0]' -days 3650
+        chdir={{ conf_path  }}
+        creates={{conf_path}}/{{proj_name}}.crt
+      become: true
+      #      when: tls_enabled
+      #notify: restart nginx
+
+    - name: Remove default nginx config file
+      file: path=/etc/nginx/sites-enabled/default state: absent
+      become: true
+      #notify: restart nginx
+
+    - name: Set nginx config file
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/sites-available/mezzanine.conf
+      become: true
+      #notify: restart nginx
+    
+    - name: Enable nginx config
+      file:
+        src: /etc/nginx/sites-available/mezzanine.conf
+        dest: /etc/nginx/sites-enabled/mezzanine.conf
+        state: link
+      become: true
+      #notify: restart nginx
+
+    - name: Set the Supervisor config file
+      template:
+        src: templates/supervisor.conf.j2
+        dest: /etc/supervisor/conf.d/mezzanine.conf
+      become: true
+      #notify: restart supervisor
+
+    - name: Install poll twitter cron job
+      cron:
+        name: "poll twitter"
+        minute: "*/5"
+        user: {{ user  }}
+        job: "{{  manage  }} poll_twitter"
+
+    - name: Set gunicorn conf file
+      template:
+        src: templates/gunicorn.conf.j2
+        dest: "{{  proj_path }}/gunicorn.conf.py"
+
+    - name: Generate settings file
+      template:
+        src: templates/local_settings.py.j2
+        dest: "{{ proj_path  }}/local_settings.py"
+
+    - name: Install Python requirements
+      pip: requirements={{  proj_path  }}/{{  reqs_path  }} virtualenv={{  venv_path  }}
+
+    - name: Install Python packages
+      pip: name={{  item  }} virtualenv={{  venv_path  }}
+      with_items:
+        - gunicorn
+        - setproctitle
+        - psycopg2
+        - django-compressor
+        - python-memcached
+
+    - name: Apply migrations
+      django_manage:
+        command: "{{  item  }}"
+        app_path: "{{  proj_path  }}"
+        virtualenv: "{{  venv_path  }}"
+      with_items:
+        - migrate
+        - collectstatic
